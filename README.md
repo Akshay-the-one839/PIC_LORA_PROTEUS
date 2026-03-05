@@ -17,7 +17,7 @@ PIC_LORA_PROTEUS/
 
 - Compiler → **CCS PIC C Compiler**  
 - Simulation → **Proteus** (v8 or later recommended)  
-- Target MCU → **PIC16F877A** (or your chosen model)
+- Target MCU → **PIC18F25K22** (or your chosen model)
 
 ## 🚀 Quick Start – How to Use
 
