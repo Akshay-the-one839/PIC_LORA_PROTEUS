@@ -1,0 +1,190 @@
+000     @SCRATCH
+001     @SCRATCH
+001     _RETURN_
+002     @SCRATCH
+003     @SCRATCH
+004     @INTERRUPT_AREA
+005     @INTERRUPT_AREA
+006     @INTERRUPT_AREA
+007     @INTERRUPT_AREA
+008     @INTERRUPT_AREA
+009     @INTERRUPT_AREA
+00A     @INTERRUPT_AREA
+00B     @INTERRUPT_AREA
+00C     @INTERRUPT_AREA
+00D     @INTERRUPT_AREA
+00E     @INTERRUPT_AREA
+00F     @INTERRUPT_AREA
+010     @INTERRUPT_AREA
+011     @INTERRUPT_AREA
+012     @INTERRUPT_AREA
+013     @INTERRUPT_AREA
+014     @INTERRUPT_AREA
+015     @INTERRUPT_AREA
+016-017 strtok.save
+018-01B _Randseed
+01C     i
+01D     j
+01E     k
+01F     ch
+020-023 a
+024-026 b
+027-028 c
+029     state1
+02A     state2
+02B     state3
+02C     state4
+02D     state5
+02E     state6
+02F     state7
+030     state8
+031.0   flgg
+031.1   flg
+031.2   RX_Command_Ready
+031.3   vanoflg1
+031.4   vanoflg2
+031.5   vanoflg3
+031.6   vanoflg4
+031.7   vanoflg5
+032-033 bw
+034-065 RxBuffer
+066     index
+067-06F TimeBuffer
+070     vno1
+071     vno2
+072     vno3
+073     vno4
+074     vno5
+075     vno6
+076     vno7
+077     vno8
+078     star
+079     timer
+07A.0   vanoflg6
+07A.1   vanoflg7
+07A.2   vanoflg8
+07A.3   txflg
+07A.4   txflgg
+07B     overflow_count
+07C     sec
+07D     min
+07E     hr
+07F     bwmin
+080     bwminv1
+081     bwminv2
+082-083 eeprom_base_address
+084     @PSTRINGCN_9600_31766_31767.P1
+084-085 txvalve.i2
+084     @PSTRINGC_9600_31766_31767.@SCRATCH1
+084     @PSTRINGR_9600_31766_31767.@SCRATCH1
+084     MAIN.@SCRATCH1
+085     @PSTRINGC_9600_31766_31767.@SCRATCH2
+085     @PSTRINGCN_9600_31766_31767.@SCRATCH1
+085     @PSTRINGR_9600_31766_31767.@SCRATCH2
+086     @delay_ms1.P1
+086     txvalve.@SCRATCH1
+086     @PSTRINGCN_9600_31766_31767.@SCRATCH2
+087     RDA_isr.c
+087     timer1_isr.@SCRATCH1
+088     RDA_isr.m
+088     timer1_isr.@SCRATCH2
+089     RDA_isr.sid
+08A     RDA_isr.i
+08B     RDA_isr.x
+08C     RDA_isr.@SCRATCH1
+08D     RDA_isr.@SCRATCH2
+F55     CCP_5_LOW
+F55     CCP_5
+F56     CCP_5_HIGH
+F58     CCP_4_LOW
+F58     CCP_4
+F59     CCP_4_HIGH
+F5E     CCP_3
+F5E     CCP_3_LOW
+F5F     CCP_3_HIGH
+F67     CCP_2_LOW
+F67     CCP_2
+F68     CCP_2_HIGH
+F78.6   C2OUT
+F79.6   C1OUT
+FAB     RCSTA
+FAB.1   OERR
+FAB.2   FERR
+FAB.4   CREN
+FBE     CCP_1_LOW
+FBE     CCP_1
+FBF     CCP_1_HIGH
+FE1-FE2 @WRITE_PACKED_MEMORY.P1
+FE1-FE2 @READ_PACKED_MEMORY.P2
+FE9-FEA @READ_PACKED_MEMORY.P1
+FE9-FEA @WRITE_PROGRAM_MEMORY.P2
+FE9-FEA @READ_PROGRAM_MEMORY.P3
+FE9-FEA @WRITE_PACKED_MEMORY.P4
+FF6-FF8 @WRITE_PROGRAM_MEMORY.P1
+FF6-FF8 @READ_PROGRAM_MEMORY.P2
+
+ROM Allocation:
+0000A2  timer1_isr
+00015C  RDA_isr
+0001F4  @const1068.call
+000212  @const1104.call
+00022C  @const1106.call
+00023A  @const1109.call
+000248  @const1111.call
+00025E  @const1112.call
+000274  @const1113.call
+00028A  @const1114.call
+0002A0  @const1115.call
+0002B6  @const1116.call
+0002CC  @const1117.call
+0002E2  @const1118.call
+0002F8  @const1119.call
+000310  setup_timer1_for_1s_interrupt
+000324  @PSTRINGC_9600_31766_31767
+000346  @PSTRINGCN_9600_31766_31767
+000366  @PSTRINGR_9600_31766_31767
+00038E  parse_packet
+000634  @delay_ms1
+00065A  txvalve
+0007A4  @cinit1
+0007A4  MAIN
+000818  @cinit2
+0136  StrtoulGO
+0136  StrtolGO
+
+Project Directory:
+    C:\PIC_LOra\
+
+Project Files:
+    PIC_LORA.c                                              [05-Mar-26 10:52  CRC=4199331D]
+    ..\Program Files (x86)\PICC\Devices\18F25K22.h          [12-Nov-13 14:35  CRC=C9966415]
+    ..\Program Files (x86)\PICC\Drivers\stdlib.h            [08-Jun-11 14:39  CRC=0B6669CF]
+    ..\Program Files (x86)\PICC\Drivers\stddef.h            [16-Jul-10 09:27  CRC=897CEC6C]
+    ..\Program Files (x86)\PICC\Drivers\string.h            [14-Jul-11 10:13  CRC=23EDEC8F]
+    ..\Program Files (x86)\PICC\Drivers\ctype.h             [03-Jan-08 13:55  CRC=2D1F019F]
+    ..\Program Files (x86)\PICC\Drivers\internal_eeprom.c   [24-Aug-12 16:54  CRC=D75DC435]
+
+Source signature=9FDB6405
+
+Units:
+    PIC_LORA (main)
+
+Compiler Settings:
+    Processor:      PIC18F25K22
+    Pointer Size:   16
+    ADC Range:      0-1023
+    Opt Level:      9
+    Short,Int,Long: UNSIGNED: 1,8,16
+    Float,Double:   32,32
+
+Output Files:
+    XREF file:   PIC_LORA.xsym
+    Errors:      PIC_LORA.err
+    Ext Symbols: PIC_LORA.esym
+    INHX32:      PIC_LORA.hex
+    Symbols:     PIC_LORA.sym
+    List:        PIC_LORA.lst
+    Debug/COFF:  PIC_LORA.cof
+    Project:     PIC_LORA.ccspjt
+    Call Tree:   PIC_LORA.tre
+    Statistics:  PIC_LORA.STA

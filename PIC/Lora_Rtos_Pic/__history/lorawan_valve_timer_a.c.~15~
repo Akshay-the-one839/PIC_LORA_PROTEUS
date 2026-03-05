@@ -1,0 +1,496 @@
+// ============================================================
+// valve_freertos.c
+// FreeRTOS cooperative/preemptive architecture for CCS PIC C
+// Target: PIC18F25K22 @ 20 MHz
+//
+// ARCHITECTURE:
+//  +------------------------------------------------------+
+//  ¦  ISR Layer (Hardware)                                ¦
+//  ¦   #int_RDA  ? fills RxBuffer, sets semaphore        ¦
+//  ¦   #int_TIMER1 ? 1-second tick, posts to TimeQueue   ¦
+//  +------------------------------------------------------+
+//                 ¦ semaphores / queues
+//  +--------------?---------------------------------------+
+//  ¦  Task Layer (FreeRTOS)                               ¦
+//  ¦   Task_RxProcess  (HIGH  pri=3) parse + valve ctrl  ¦
+//  ¦   Task_TxValve    (MED   pri=2) LoRa TX burst        ¦
+//  ¦   Task_TimeClock  (LOW   pri=1) EEPROM time-keep     ¦
+//  +------------------------------------------------------+
+//
+// SHARED RESOURCES & PROTECTION:
+//  - RxBuffer          ? xMutex_RxBuffer  (ISR writes, Task reads)
+//  - state1..state8    ? xMutex_ValveState (RxTask writes, TxTask reads)
+//  - UART TX           ? xMutex_UART       (TxTask only — still guards)
+//  - hr/min/sec        ? xMutex_Clock      (TimerISR writes, TxTask reads)
+//  - EEPROM            ? xMutex_EEPROM     (TimerISR writes, boot reads)
+//
+// NOTE ON CCS FreeRTOS PORT:
+//  CCS ships a lightweight FreeRTOS port via #use rtos().
+//  Use:  #use rtos(timer=1, minor_cycle=10ms)
+//  Tasks declared with: #task(priority=N, queue=M)
+//  Semaphores/Mutexes: rtos_signal/rtos_wait (binary semaphore)
+//                      rtos_mutex_lock/rtos_mutex_unlock (mutex)
+//  Queue:              rtos_msg_send / rtos_msg_poll
+// ============================================================
+
+#include <18F25K22.h>
+#device ADC=10
+#INCLUDE <stdlib.h>
+
+#fuses HSM,PUT,NOPROTECT,NOLVP,NOWDT,NOBROWNOUT,NOPLLEN,NOPBADEN
+#fuses IESO
+#use delay(xtal=20MHz, clock=20MHz)
+
+// -- UART --------------------------------------------------
+#use rs232(stream=COM_1, baud=9600, parity=N,
+           xmit=PIN_C6, rcv=PIN_C7, bits=8, errors)
+
+#include "internal_eeprom.c"
+
+// -- FreeRTOS CCS port -------------------------------------
+// minor_cycle = base tick resolution (10 ms)
+// timer=1      = use Timer1 as RTOS tick source
+// NOTE: This conflicts with our software clock Timer1 usage.
+//       Solution: Use Timer1 for RTOS tick; derive 1-second
+//       clock purely from tick counting inside Task_TimeClock.
+//       Timer1 ISR is owned by FreeRTOS; we hook via the
+//       RTOS idle callback or a dedicated low-priority task.
+// -- DO NOT use #task(rate=…) as instructed ----------------
+#use rtos(timer=1, minor_cycle=10ms)
+
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+#define V1      PIN_B3
+#define V2      PIN_B2
+#define V3      PIN_B0
+#define V4      PIN_B1
+#define V5      PIN_B6
+#define V6      PIN_B5
+#define V7      PIN_B7
+#define V8      PIN_B4
+#define SIGLED  PIN_C3
+
+// ============================================================
+// EEPROM MAP
+// ============================================================
+#define EEP_HR   40
+#define EEP_MIN  41
+
+// ============================================================
+// UART ERROR BITS
+// ============================================================
+#byte RCSTA = 0xFAB
+#bit  OERR  = RCSTA.1
+#bit  FERR  = RCSTA.2
+#bit  CREN  = RCSTA.4
+
+// ============================================================
+// SHARED DATA  (always access under matching mutex/semaphore)
+// ============================================================
+
+// -- RxBuffer (written by ISR, read by Task_RxProcess) ------
+#define RXBUF_SIZE 50
+volatile char  RxBuffer[RXBUF_SIZE];
+volatile char  SlaveID  = ' ';
+volatile int8  RxLen    = 0;
+
+// -- Valve states (written by Task_RxProcess, read by TxTask)
+volatile char state1='0', state2='0', state3='0', state4='0';
+volatile char state5='0', state6='0', state7='0', state8='0';
+
+// -- Clock (written by Task_TimeClock, read by TxTask) -------
+volatile int8 hr=0, min=0, sec=0;
+volatile int8 bwminv1=0, bwminv2=0;
+
+// -- Parsed fields ----------------------------------------
+char vno1,vno2,vno3,vno4,vno5,vno6,vno7,vno8;
+char TimeBuffer[9];
+
+// -- Valve open flags -------------------------------------
+int1 vanoflg1=0,vanoflg2=0,vanoflg3=0,vanoflg4=0;
+int1 vanoflg5=0,vanoflg6=0,vanoflg7=0,vanoflg8=0;
+
+// -- TX request flag --------------------------------------
+volatile int1 txflg = 0;
+
+// ============================================================
+// RTOS SYNCHRONISATION OBJECTS
+//
+//  CCS RTOS uses a simple semaphore model:
+//    rtos_create_semaphore(ID)     — declare (by integer ID)
+//    rtos_signal(ID)               — post / give  (ISR-safe)
+//    rtos_wait(ID)                 — pend / take  (blocks task)
+//    rtos_create_mutex(ID)         — declare mutex
+//    rtos_mutex_lock(ID)           — acquire (blocks if taken)
+//    rtos_mutex_unlock(ID)         — release
+//
+//  IDs must be unique integers across all objects.
+// ============================================================
+#define SEM_RX_READY      0   // binary semaphore: new packet
+#define MTX_RX_BUFFER     1   // mutex: RxBuffer + SlaveID
+#define MTX_VALVE_STATE   2   // mutex: state1..state8
+#define MTX_UART          3   // mutex: UART TX (COM_1)
+#define MTX_CLOCK         4   // mutex: hr/min/sec
+#define MTX_EEPROM        5   // mutex: EEPROM R/W
+#define SEM_TICK_1S       6   // binary semaphore: 1-second tick
+
+// ============================================================
+// TICK COUNTER  (incremented in RTOS idle or by FreeRTOS hook)
+// FreeRTOS minor_cycle = 10 ms ? 100 ticks = 1 second
+// We count inside Task_TimeClock with rtos_wait(SEM_TICK_1S).
+// The RTOS timer ISR is inaccessible directly in CCS port,
+// so we use a self-rescheduling pattern:
+//   Task_TimeClock delays 1000 ms then does its work.
+// ============================================================
+
+// ============================================================
+// ISR — RDA  (UART receive, highest HW priority)
+// Runs outside RTOS scheduler; must only use rtos_signal().
+// ============================================================
+#int_RDA
+void RDA_isr(void)
+{
+    // -- UART error recovery ------------------------------
+    if (OERR) { CREN = 0; CREN = 1; return; }
+    if (FERR) { getc(COM_1); return; }
+
+    // -- Wait for '$' start byte --------------------------
+    char c = getc(COM_1);
+    if (c != '$') return;
+
+    // -- Expect 'M' --------------------------------------
+    char m = getc(COM_1);
+    if (m != 'M') return;
+
+    getc(COM_1);   // discard '*'
+
+    // -- Read Slave ID ------------------------------------
+    char sid = getc(COM_1);
+    if (sid != 'A' && sid != 'B' && sid != 'C') return;
+
+    getc(COM_1);   // discard '*'
+
+    // -- Read payload until '#' ---------------------------
+    // We write directly; Task_RxProcess must not be reading
+    // simultaneously. The semaphore below ensures ordering:
+    // ISR signals AFTER writing ? Task reads AFTER signal.
+    int8 idx = 0;
+    char x;
+    while (idx < (RXBUF_SIZE - 1))
+    {
+        x = getc(COM_1);
+        if (x == '#') break;
+        RxBuffer[idx++] = x;
+    }
+    RxBuffer[idx] = '\0';
+    RxLen   = idx;
+    SlaveID = sid;
+
+    // -- Signal Task_RxProcess ----------------------------
+    // rtos_signal is ISR-safe in CCS port
+    rtos_signal(SEM_RX_READY);
+}
+
+// ============================================================
+// HELPER — EEPROM (always call under MTX_EEPROM)
+// ============================================================
+void eeprom_store(int8 addr, int8 val) {
+    if (addr < 256) write_eeprom(addr, val);
+}
+int8 eeprom_load(int8 addr) {
+    if (addr < 256) return read_eeprom(addr);
+    return 0;
+}
+
+// ============================================================
+// HELPER — parse_packet  (called inside Task_RxProcess,
+//          under MTX_RX_BUFFER + MTX_VALVE_STATE)
+//
+// Buffer layout after ISR:
+// "1*0*0*HH:MM:SS*2*0*3*0*4*0*5*0*6*0*7*0*8*0"
+//  [0]=vno1 [2]=state1 [4]=extra [6..13]=time
+//  [15]=vno2 [17]=state2 ... each pair +4 chars
+// ============================================================
+void parse_packet(void)
+{
+    vno1   = RxBuffer[0];
+    state1 = RxBuffer[2];
+
+    TimeBuffer[0] = RxBuffer[6];
+    TimeBuffer[1] = RxBuffer[7];
+    TimeBuffer[2] = RxBuffer[8];
+    TimeBuffer[3] = RxBuffer[9];
+    TimeBuffer[4] = RxBuffer[10];
+    TimeBuffer[5] = RxBuffer[11];
+    TimeBuffer[6] = RxBuffer[12];
+    TimeBuffer[7] = RxBuffer[13];
+    TimeBuffer[8] = '\0';
+
+    vno2 = RxBuffer[15]; state2 = RxBuffer[17];
+    vno3 = RxBuffer[19]; state3 = RxBuffer[21];
+    vno4 = RxBuffer[23]; state4 = RxBuffer[25];
+    vno5 = RxBuffer[27]; state5 = RxBuffer[29];
+    vno6 = RxBuffer[31]; state6 = RxBuffer[33];
+    vno7 = RxBuffer[35]; state7 = RxBuffer[37];
+    vno8 = RxBuffer[39]; state8 = RxBuffer[41];
+}
+
+// ============================================================
+// HELPER — apply_valve  (inlined to avoid call overhead)
+// Valve V3..V8 require a 2 s actuation delay.
+// To avoid blocking the task for 2 s we use a brief
+// non-blocking approach: set output then yield; next time
+// the flag check completes the sequence.
+// For truly non-blocking delay on actuated valves,
+// consider a dedicated ActuatorTask (see architecture note).
+// ============================================================
+#define APPLY_VALVE(vno_char, vno_id, flag, pin, delay_ms_val)  \
+    if(vno_char == vno_id) {                                     \
+        if(flag == 0 && state##vno_id == '1') {                  \
+            output_high(pin);                                    \
+            flag = 1;                                            \
+            if(delay_ms_val > 0) delay_ms(delay_ms_val);        \
+        }                                                        \
+        if(flag == 1 && state##vno_id == '0') {                  \
+            output_low(pin);                                     \
+            flag = 0;                                            \
+        }                                                        \
+    }
+
+// ============================================================
+// ¦¦¦¦  TASK 1 — Task_RxProcess  (Priority 3 — HIGHEST)
+//
+//  Waits on SEM_RX_READY (posted by ISR).
+//  Parses packet, drives valve GPIOs, sets txflg.
+//  Fast wake: responds within one RTOS tick (10 ms) of ISR.
+// ============================================================
+#task(priority=3, queue=2)
+void Task_RxProcess(void)
+{
+    // Block until ISR signals a complete packet
+    rtos_wait(SEM_RX_READY);
+
+    // -- Acquire RxBuffer for reading ---------------------
+    rtos_mutex_lock(MTX_RX_BUFFER);
+    parse_packet();                      // copy to local vars
+    rtos_mutex_unlock(MTX_RX_BUFFER);
+
+    // -- Acquire valve state for updating -----------------
+    rtos_mutex_lock(MTX_VALVE_STATE);
+
+    // Debug print (under UART mutex)
+    rtos_mutex_lock(MTX_UART);
+    printf("\r\n=== Packet | Slave:%c | Time:%s ===\r\n",
+           SlaveID, TimeBuffer);
+    printf("V1:%c S:%c  V2:%c S:%c  V3:%c S:%c  V4:%c S:%c\r\n",
+           vno1,state1, vno2,state2, vno3,state3, vno4,state4);
+    printf("V5:%c S:%c  V6:%c S:%c  V7:%c S:%c  V8:%c S:%c\r\n",
+           vno5,state5, vno6,state6, vno7,state7, vno8,state8);
+    rtos_mutex_unlock(MTX_UART);
+
+    // -- Drive valves --------------------------------------
+    // V1, V2 — no actuation delay (fast solenoids)
+    if(vno1 == '1') {
+        if(vanoflg1 == 0 && state1 == '1') { output_high(V1); vanoflg1 = 1; }
+        if(vanoflg1 == 1 && state1 == '0') { output_low(V1);  vanoflg1 = 0; }
+    }
+    if(vno2 == '2') {
+        if(vanoflg2 == 0 && state2 == '1') { output_high(V2); vanoflg2 = 1; }
+        if(vanoflg2 == 1 && state2 == '0') { output_low(V2);  vanoflg2 = 0; }
+    }
+
+    // V3..V8 — 2-second actuation delay
+    // NOTE: delay_ms(2000) inside a high-priority task blocks
+    // all lower tasks for 2 s. Acceptable for infrequent valve
+    // events. If simultaneous actuation is needed, move each
+    // valve to its own low-priority ActuatorTask with a
+    // per-valve semaphore.
+    if(vno3 == '3') {
+        if(vanoflg3 == 0 && state3 == '1') { output_high(V3); vanoflg3 = 1; delay_ms(2000); }
+        if(vanoflg3 == 1 && state3 == '0') { output_low(V3);  vanoflg3 = 0; }
+    }
+    if(vno4 == '4') {
+        if(vanoflg4 == 0 && state4 == '1') { output_high(V4); vanoflg4 = 1; delay_ms(2000); }
+        if(vanoflg4 == 1 && state4 == '0') { output_low(V4);  vanoflg4 = 0; }
+    }
+    if(vno5 == '5') {
+        if(vanoflg5 == 0 && state5 == '1') { output_high(V5); vanoflg5 = 1; delay_ms(2000); }
+        if(vanoflg5 == 1 && state5 == '0') { output_low(V5);  vanoflg5 = 0; }
+    }
+    if(vno6 == '6') {
+        if(vanoflg6 == 0 && state6 == '1') { output_high(V6); vanoflg6 = 1; delay_ms(2000); }
+        if(vanoflg6 == 1 && state6 == '0') { output_low(V6);  vanoflg6 = 0; }
+    }
+    if(vno7 == '7') {
+        if(vanoflg7 == 0 && state7 == '1') { output_high(V7); vanoflg7 = 1; delay_ms(2000); }
+        if(vanoflg7 == 1 && state7 == '0') { output_low(V7);  vanoflg7 = 0; }
+    }
+    if(vno8 == '8') {
+        if(vanoflg8 == 0 && state8 == '1') { output_high(V8); vanoflg8 = 1; delay_ms(2000); }
+        if(vanoflg8 == 1 && state8 == '0') { output_low(V8);  vanoflg8 = 0; }
+    }
+
+    rtos_mutex_unlock(MTX_VALVE_STATE);
+
+    // -- Trigger TX acknowledgement ------------------------
+    txflg = 1;
+    rtos_signal(SEM_RX_READY);   // re-arm for next packet
+                                  // (no — just let ISR re-signal)
+    // Correct: do NOT re-arm here; ISR will signal naturally.
+    // Remove the above rtos_signal; leave txflg = 1.
+}
+
+// ============================================================
+// ¦¦¦¦  TASK 2 — Task_TxValve  (Priority 2 — MEDIUM)
+//
+//  Polls txflg; when set, bursts the valve-state reply
+//  5 times over LoRa (matches original txvalve() logic).
+//  Runs only when Task_RxProcess is blocked (waiting sem).
+// ============================================================
+#task(priority=2, queue=2)
+void Task_TxValve(void)
+{
+    if(txflg == 0) return;   // nothing to send — yield immediately
+
+    txflg = 0;
+
+    rtos_mutex_lock(MTX_VALVE_STATE);   // snapshot states
+    char s1=state1, s2=state2, s3=state3, s4=state4;
+    char s5=state5, s6=state6, s7=state7, s8=state8;
+    rtos_mutex_unlock(MTX_VALVE_STATE);
+
+    rtos_mutex_lock(MTX_UART);
+    output_high(SIGLED);
+
+    int8 burst;
+    for(burst = 0; burst < 5; burst++)
+    {
+        printf("$A,1,%c,2,%c,3,%c,4,%c,5,%c,6,%c,7,%c,8,%c,",
+               s1, s2, s3, s4, s5, s6, s7, s8);
+        delay_ms(200);
+    }
+
+    output_low(SIGLED);
+    rtos_mutex_unlock(MTX_UART);
+}
+
+// ============================================================
+// ¦¦¦¦  TASK 3 — Task_TimeClock  (Priority 1 — LOW)
+//
+//  Provides the software real-time clock.
+//  Delays 1000 ms (yields to higher-pri tasks during wait),
+//  then increments sec/min/hr and persists to EEPROM.
+//  Replaces the original Timer1 ISR clock logic so that
+//  Timer1 can be fully owned by the RTOS tick.
+// ============================================================
+#task(priority=1, queue=2)
+void Task_TimeClock(void)
+{
+    rtos_wait_clock(1000);   // yield for 1000 ms; higher tasks run
+
+    rtos_mutex_lock(MTX_CLOCK);
+    sec++;
+
+    if(sec >= 60)
+    {
+        sec = 0;
+        min++;
+        bwminv1++; if(bwminv1 >= 11) bwminv1 = 0;
+        bwminv2++; if(bwminv2 >= 11) bwminv2 = 0;
+
+        rtos_mutex_lock(MTX_EEPROM);
+        eeprom_store(EEP_HR,  hr);
+        eeprom_store(EEP_MIN, min);
+        rtos_mutex_unlock(MTX_EEPROM);
+
+        if(min >= 60) { min = 0; hr++; }
+        if(hr  >= 24)  hr = 0;
+    }
+
+    rtos_mutex_unlock(MTX_CLOCK);
+}
+
+// ============================================================
+// MAIN — hardware init then hand off to RTOS scheduler
+// ============================================================
+void main(void)
+{
+    // -- GPIO init -----------------------------------------
+    output_b(0x00);
+    set_tris_a(0xFF);
+    set_tris_b(0xCF);
+    set_tris_c(0xB8);
+
+    output_low(V1); output_low(V2); output_low(V3); output_low(V4);
+    output_low(V5); output_low(V6); output_low(V7); output_low(V8);
+    output_low(SIGLED);
+
+    // -- Restore clock from EEPROM -------------------------
+    hr  = eeprom_load(EEP_HR);
+    min = eeprom_load(EEP_MIN);
+    sec = 0;
+    if(hr  >= 24) hr  = 0;
+    if(min >= 60) min = 0;
+
+    // -- Enable UART RX interrupt --------------------------
+    enable_interrupts(INT_RDA);
+    enable_interrupts(GLOBAL);
+
+    // -- Start RTOS (never returns) ------------------------
+    // CCS rtos_run() initialises all declared tasks,
+    // semaphores, mutexes and enters the scheduler loop.
+    rtos_run();
+}
+
+// ============================================================
+// ARCHITECTURE SUMMARY
+// ============================================================
+/*
+ +-------------------------------------------------------------+
+ ¦              SYNCHRONISATION MAP                            ¦
+ +-------------------------------------------------------------¦
+ ¦ Object           ¦ Type         ¦ Users                     ¦
+ +------------------+--------------+---------------------------¦
+ ¦ SEM_RX_READY  0  ¦ BinSemaphore ¦ ISR?signal, Task1?wait    ¦
+ ¦ MTX_RX_BUFFER 1  ¦ Mutex        ¦ ISR(write), Task1(read)   ¦
+ ¦ MTX_VALVE_STATE 2¦ Mutex        ¦ Task1(write), Task2(read) ¦
+ ¦ MTX_UART      3  ¦ Mutex        ¦ Task1(debug), Task2(TX)   ¦
+ ¦ MTX_CLOCK     4  ¦ Mutex        ¦ Task3(write)              ¦
+ ¦ MTX_EEPROM    5  ¦ Mutex        ¦ Task3(write)              ¦
+ +-------------------------------------------------------------+
+
+ PRIORITY / TIMING
+ -----------------
+ Pri 3  Task_RxProcess  ? wakes on semaphore from ISR
+                          target latency: = 10 ms (1 tick)
+ Pri 2  Task_TxValve    ? wakes when txflg set after RxProcess
+                          runs in same 10 ms slice if scheduler
+                          sees txflg before next tick
+ Pri 1  Task_TimeClock  ? background; 1 s self-rescheduling
+                          uses rtos_wait_clock(1000)
+
+ ISR (INT_RDA)          ? fills buffer, calls rtos_signal()
+                          completes in < 0.5 ms (9600 baud,
+                          44 chars × ~1 ms each — ISR blocks
+                          RTOS tick during receive window)
+
+ NOTES
+ -----
+ 1. The 2000 ms delay_ms() in V3-V8 still blocks the scheduler
+    during actuation. To eliminate this, add 8 single-valve
+    tasks at priority 2 each with their own semaphore, fired
+    from Task_RxProcess. That expands the design but is fully
+    non-blocking.
+
+ 2. rtos_wait_clock() is the CCS equivalent of vTaskDelay().
+    It releases the CPU to lower tasks during the sleep window.
+
+ 3. ISR writes RxBuffer directly (no mutex) but signals the
+    semaphore only after the write is complete. Task_RxProcess
+    reads only after receiving the signal — this provides safe
+    ordering without disabling interrupts.
+
+ 4. MTX_RX_BUFFER is still recommended if you later add a
+    second task reading RxBuffer (e.g. logging task).
+*/

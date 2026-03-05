@@ -1,0 +1,438 @@
+// =============================================================
+//  Valve Controller — PIC18F25K22
+//  Using CCS Built-in RTOS (#use rtos)
+//  
+//  Tasks:
+//    uart_task    — drains ring buffer, parses $M*A*..# packet
+//    valve_task   — drives GPIO based on parsed packet
+//    tx_task      — sends $A,1,s1,...,8,s8, reply
+//    clock_task   — maintains HH:MM:SS clock
+//
+//  Shared data protection:
+//    Ring buffer  — lock-free (ISR writes head, uart_task reads tail)
+//    Parsed data  — g_pkt_ready flag + g_pkt struct (uart sets, valve clears)
+//    Valve states — g_valve_state[] (valve_task writes, tx_task reads)
+//    TX trigger   — g_tx_ready flag (valve_task sets, tx_task clears)
+//    Clock        — g_clock_hr/min/sec (timer ISR writes, clock_task reads)
+// =============================================================
+
+#include <18F25K22.h>
+#device ADC=10
+#include <stdlib.h>
+#include <string.h>
+
+#fuses HSM,PUT,NOPROTECT,NOLVP,NOWDT,NOBROWNOUT,NOPLLEN,NOPBADEN
+#fuses IESO
+#use delay(xtal=20MHz, clock=20MHz)
+
+#use rs232(stream=COM_1, baud=9600, parity=N, xmit=PIN_C6, rcv=PIN_C7, bits=8)
+#include "internal_eeprom.c"
+
+// -------------------------------------------------------
+// CCS RTOS — each task gets a 1ms time slot by default
+// Minor cycle = 1ms, each task runs at its own rate
+// -------------------------------------------------------
+#use rtos(timer=1, minor_cycle=1ms)
+
+// -------------------------------------------------------
+// GPIO
+// -------------------------------------------------------
+#define V1     PIN_B3
+#define V2     PIN_B2
+#define V3     PIN_B0
+#define V4     PIN_B1
+#define V5     PIN_B6
+#define V6     PIN_B5
+#define V7     PIN_B7
+#define V8     PIN_B4
+#define SIGLED PIN_C3
+
+// -------------------------------------------------------
+// UART hardware error bits
+// -------------------------------------------------------
+#byte RCSTA = 0xFAB
+#bit  OERR  = RCSTA.1
+#bit  FERR  = RCSTA.2
+#bit  CREN  = RCSTA.4
+
+// -------------------------------------------------------
+// Ring buffer — ISR writes head, uart_task reads tail
+// Size must be power of 2 for fast masking
+// -------------------------------------------------------
+#define RING_SIZE  128
+#define RING_MASK  (RING_SIZE - 1)
+
+volatile char g_ring[RING_SIZE];
+volatile int8 g_ring_head = 0;   // ISR writes ONLY
+volatile int8 g_ring_tail = 0;   // uart_task reads ONLY
+
+// -------------------------------------------------------
+// Parsed packet struct — filled by uart_task
+// -------------------------------------------------------
+typedef struct {
+    char slave_id;
+    char time_str[9];    // "HH:MM:SS\0"
+    char vno[8];         // '1'..'8'
+    char state[8];       // '0' or '1'
+} ParsedPacket_t;
+
+volatile int1          g_pkt_ready  = 0;    // uart_task sets, valve_task clears
+volatile ParsedPacket_t g_pkt;               // shared parsed packet
+
+// -------------------------------------------------------
+// Valve state — valve_task writes, tx_task reads
+// -------------------------------------------------------
+volatile char g_valve_state[8] = {'0','0','0','0','0','0','0','0'};
+volatile int1 g_vanoflg[8]     = {0,0,0,0,0,0,0,0};
+volatile int1 g_tx_ready       = 0;    // valve_task sets, tx_task clears
+
+// -------------------------------------------------------
+// Clock state — Timer1 ISR increments tick_count
+// clock_task converts ticks ? seconds
+// -------------------------------------------------------
+volatile int8 g_tick_count = 0;   // ISR increments, clock_task resets
+volatile int8 g_sec  = 0;
+volatile int8 g_min  = 0;
+volatile int8 g_hr   = 0;
+volatile int8 g_bwminv1 = 0;
+volatile int8 g_bwminv2 = 0;
+
+#define EEPROM_BASE 0
+
+// =============================================================
+//  Timer1 ISR — fires every ~50ms, clock_task counts 20 = 1sec
+// =============================================================
+#INT_TIMER1
+void timer1_isr(void)
+{
+    set_timer1(34286);
+    g_tick_count++;
+}
+
+// =============================================================
+//  UART RDA ISR — writes ONE byte to ring buffer, nothing else
+// =============================================================
+#int_RDA
+void RDA_isr(void)
+{
+    if (oerr) { CREN = 0; CREN = 1; return; }
+    if (ferr) { getc(COM_1); return; }
+
+    char c = getc(COM_1);
+
+    int8 next = (g_ring_head + 1) & RING_MASK;
+    if (next != g_ring_tail)       // drop byte if ring full
+    {
+        g_ring[g_ring_head] = c;
+        g_ring_head = next;
+    }
+}
+
+// =============================================================
+//  uart_task — 10ms rate
+//  Reads ring buffer byte by byte using a state machine
+//  Assembles full $M*A*..# packet then sets g_pkt_ready
+//
+//  State machine:
+//    WAIT_DOLLAR  ? wait for '$'
+//    WAIT_M       ? wait for 'M'
+//    WAIT_STAR1   ? wait for '*'
+//    WAIT_SLAVEID ? read 'A'/'B'/'C'
+//    WAIT_STAR2   ? wait for '*'
+//    READ_PAYLOAD ? accumulate bytes until '#'
+// =============================================================
+#define ST_DOLLAR   0
+#define ST_M        1
+#define ST_STAR1    2
+#define ST_SLAVEID  3
+#define ST_STAR2    4
+#define ST_PAYLOAD  5
+
+#task(rate=10ms, max=9ms)
+void uart_task(void)
+{
+    static int8  state    = ST_DOLLAR;
+    static char  slave_id = ' ';
+    static char  payload[50];
+    static int8  pay_idx  = 0;
+
+    // Process ALL bytes currently in ring buffer in one task call
+    while (g_ring_tail != g_ring_head)
+    {
+        char c = g_ring[g_ring_tail];
+        g_ring_tail = (g_ring_tail + 1) & RING_MASK;
+
+        switch (state)
+        {
+            case ST_DOLLAR:
+                if (c == '$') state = ST_M;
+                break;
+
+            case ST_M:
+                state = (c == 'M') ? ST_STAR1 : ST_DOLLAR;
+                break;
+
+            case ST_STAR1:
+                state = (c == '*') ? ST_SLAVEID : ST_DOLLAR;
+                break;
+
+            case ST_SLAVEID:
+                if (c == 'A' || c == 'B' || c == 'C') {
+                    slave_id = c;
+                    state    = ST_STAR2;
+                } else {
+                    state = ST_DOLLAR;
+                }
+                break;
+
+            case ST_STAR2:
+                if (c == '*') {
+                    pay_idx = 0;
+                    state   = ST_PAYLOAD;
+                } else {
+                    state = ST_DOLLAR;
+                }
+                break;
+
+            case ST_PAYLOAD:
+                if (c == '#')
+                {
+                    payload[pay_idx] = '\0';
+
+                    // Payload: "1*0*0*02:00:00*2*0*3*0*4*0*5*0*6*0*7*0*8*0"
+                    // Index:    0 1 2 3 4 5 6789012345 6 7 8 9 ...
+                    // Positions:
+                    //  [0]     vno1
+                    //  [2]     state1
+                    //  [4]     extra field (skip)
+                    //  [6-13]  time HH:MM:SS
+                    //  [15]    vno2   [17] state2
+                    //  [19]    vno3   [21] state3
+                    //  [23]    vno4   [25] state4
+                    //  [27]    vno5   [29] state5
+                    //  [31]    vno6   [33] state6
+                    //  [35]    vno7   [37] state7
+                    //  [39]    vno8   [41] state8
+
+                    if (pay_idx >= 42 && g_pkt_ready == 0)
+                    {
+                        g_pkt.slave_id = slave_id;
+
+                        // time
+                        g_pkt.time_str[0] = payload[6];
+                        g_pkt.time_str[1] = payload[7];
+                        g_pkt.time_str[2] = payload[8];
+                        g_pkt.time_str[3] = payload[9];
+                        g_pkt.time_str[4] = payload[10];
+                        g_pkt.time_str[5] = payload[11];
+                        g_pkt.time_str[6] = payload[12];
+                        g_pkt.time_str[7] = payload[13];
+                        g_pkt.time_str[8] = '\0';
+
+                        // vno1/state1
+                        g_pkt.vno[0]   = payload[0];
+                        g_pkt.state[0] = payload[2];
+
+                        // vno2..vno8
+                        g_pkt.vno[1] = payload[15]; g_pkt.state[1] = payload[17];
+                        g_pkt.vno[2] = payload[19]; g_pkt.state[2] = payload[21];
+                        g_pkt.vno[3] = payload[23]; g_pkt.state[3] = payload[25];
+                        g_pkt.vno[4] = payload[27]; g_pkt.state[4] = payload[29];
+                        g_pkt.vno[5] = payload[31]; g_pkt.state[5] = payload[33];
+                        g_pkt.vno[6] = payload[35]; g_pkt.state[6] = payload[37];
+                        g_pkt.vno[7] = payload[39]; g_pkt.state[7] = payload[41];
+
+                        g_pkt_ready = 1;   // signal valve_task
+
+                        printf("\r\n[UART] SlaveID=%c Time=%s\r\n",
+                               g_pkt.slave_id, g_pkt.time_str);
+                        printf("V1=%c S1=%c V2=%c S2=%c V3=%c S3=%c V4=%c S4=%c\r\n",
+                               g_pkt.vno[0],g_pkt.state[0],
+                               g_pkt.vno[1],g_pkt.state[1],
+                               g_pkt.vno[2],g_pkt.state[2],
+                               g_pkt.vno[3],g_pkt.state[3]);
+                        printf("V5=%c S5=%c V6=%c S6=%c V7=%c S7=%c V8=%c S8=%c\r\n",
+                               g_pkt.vno[4],g_pkt.state[4],
+                               g_pkt.vno[5],g_pkt.state[5],
+                               g_pkt.vno[6],g_pkt.state[6],
+                               g_pkt.vno[7],g_pkt.state[7]);
+                    }
+
+                    state = ST_DOLLAR;
+                }
+                else if (pay_idx < 49)
+                {
+                    payload[pay_idx++] = c;
+                }
+                else
+                {
+                    // Overflow — reset
+                    state = ST_DOLLAR;
+                }
+                break;
+
+            default:
+                state = ST_DOLLAR;
+                break;
+        }
+    }
+}
+
+// =============================================================
+//  valve_task — 20ms rate
+//  Reads g_pkt when g_pkt_ready==1, drives GPIO outputs
+// =============================================================
+#task(rate=20ms, max=19ms)
+void valve_task(void)
+{
+    if (g_pkt_ready == 0) return;   // nothing to do
+
+    // Take a local copy then clear flag immediately
+    ParsedPacket_t pkt;
+    disable_interrupts(GLOBAL);
+    pkt         = g_pkt;
+    g_pkt_ready = 0;
+    enable_interrupts(GLOBAL);
+
+    int8 v;
+    for (v = 0; v < 8; v++)
+    {
+        char expected = '1' + v;
+        if (pkt.vno[v] != expected) continue;
+
+        if (pkt.state[v] == '1' && g_vanoflg[v] == 0)
+        {
+            // Turn ON
+            switch(v) {
+                case 0: output_high(V1); break;
+                case 1: output_high(V2); break;
+                case 2: output_high(V3); break;
+                case 3: output_high(V4); break;
+                case 4: output_high(V5); break;
+                case 5: output_high(V6); break;
+                case 6: output_high(V7); break;
+                case 7: output_high(V8); break;
+            }
+            g_vanoflg[v]     = 1;
+            g_valve_state[v] = '1';
+            printf("[VALVE] V%d ON\r\n", v + 1);
+        }
+        else if (pkt.state[v] == '0' && g_vanoflg[v] == 1)
+        {
+            // Turn OFF
+            switch(v) {
+                case 0: output_low(V1); break;
+                case 1: output_low(V2); break;
+                case 2: output_low(V3); break;
+                case 3: output_low(V4); break;
+                case 4: output_low(V5); break;
+                case 5: output_low(V6); break;
+                case 6: output_low(V7); break;
+                case 7: output_low(V8); break;
+            }
+            g_vanoflg[v]     = 0;
+            g_valve_state[v] = '0';
+            printf("[VALVE] V%d OFF\r\n", v + 1);
+        }
+    }
+
+    g_tx_ready = 1;   // signal tx_task to send reply
+}
+
+// =============================================================
+//  tx_task — 50ms rate
+//  Sends $A,1,s1,...,8,s8, reply when g_tx_ready is set
+//  Sends 5 times with 200ms gap
+// =============================================================
+#task(rate=50ms, max=49ms)
+void tx_task(void)
+{
+    static int8 rep_count = 0;
+
+    if (g_tx_ready == 0 && rep_count == 0) return;   // nothing to do
+
+    if (rep_count == 0) {
+        output_high(SIGLED);
+    }
+
+    // Send one reply per task call, repeat 5 times total
+    printf("$A,1,%c,2,%c,3,%c,4,%c,5,%c,6,%c,7,%c,8,%c,\r\n",
+           g_valve_state[0], g_valve_state[1],
+           g_valve_state[2], g_valve_state[3],
+           g_valve_state[4], g_valve_state[5],
+           g_valve_state[6], g_valve_state[7]);
+
+    rep_count++;
+
+    if (rep_count >= 5)
+    {
+        rep_count  = 0;
+        g_tx_ready = 0;
+        output_low(SIGLED);
+        printf("[TX] Reply complete\r\n");
+    }
+}
+
+// =============================================================
+//  clock_task — 100ms rate
+//  Counts Timer1 ticks (20 x 50ms = 1 second)
+// =============================================================
+#task(rate=100ms, max=99ms)
+void clock_task(void)
+{
+    if (g_tick_count < 20) return;    // not 1 second yet
+
+    disable_interrupts(INT_TIMER1);
+    g_tick_count = 0;
+    enable_interrupts(INT_TIMER1);
+
+    g_sec++;
+
+    if (g_sec >= 60)
+    {
+        g_sec = 0;
+        g_min++;
+        g_bwminv1++;
+        if (g_bwminv1 >= 11) g_bwminv1 = 0;
+        g_bwminv2++;
+        if (g_bwminv2 >= 11) g_bwminv2 = 0;
+
+        write_eeprom(EEPROM_BASE + 40, g_hr);
+        write_eeprom(EEPROM_BASE + 41, g_min);
+
+        if (g_min >= 60) { g_min = 0; g_hr++; }
+        if (g_hr  >= 24) { g_hr  = 0; }
+    }
+}
+
+// =============================================================
+//  main
+// =============================================================
+void main(void)
+{
+    // ---- GPIO init ----
+    output_b(0x00);
+    set_tris_a(0xFF);
+    SET_TRIS_b(0xCF);
+    SET_TRIS_c(0xB8);
+
+    output_low(V1); output_low(V2);
+    output_low(V3); output_low(V4);
+    output_low(V5); output_low(V6);
+    output_low(V7); output_low(V8);
+    output_low(SIGLED);
+
+    // ---- Timer1 for clock ----
+    setup_timer_1(T1_INTERNAL | T1_DIV_BY_8);
+    set_timer1(34286);
+
+    // ---- Interrupts ----
+    enable_interrupts(INT_RDA);
+    enable_interrupts(INT_TIMER1);
+    enable_interrupts(GLOBAL);
+
+    printf("\r\n[MAIN] CCS RTOS starting...\r\n");
+
+    // ---- Start CCS RTOS scheduler — never returns ----
+    rtos_run();
+}

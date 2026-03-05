@@ -1,0 +1,6 @@
+>>> Warning 215 "lorawan_valve_timer_a.c" Line 179(8,11): Undefined identifier
+>>> Warning 215 "lorawan_valve_timer_a.c" Line 243(8,11): Undefined identifier
+>>> Warning 215 "lorawan_valve_timer_a.c" Line 275(8,11): Undefined identifier
+      Memory usage:   ROM=9%      RAM=9% - 11%
+      0 Errors,  3 Warnings.
+Build Successful.

@@ -1,0 +1,191 @@
+000     @SCRATCH
+001     @SCRATCH
+001     _RETURN_
+002     @SCRATCH
+003     @SCRATCH
+004     @INTERRUPT_AREA
+005     @INTERRUPT_AREA
+006     @INTERRUPT_AREA
+007     @INTERRUPT_AREA
+008     @INTERRUPT_AREA
+009     @INTERRUPT_AREA
+00A     @INTERRUPT_AREA
+00B     @INTERRUPT_AREA
+00C     @INTERRUPT_AREA
+00D     @INTERRUPT_AREA
+00E     @INTERRUPT_AREA
+00F     @INTERRUPT_AREA
+010     @INTERRUPT_AREA
+011     @INTERRUPT_AREA
+012     @INTERRUPT_AREA
+013     @INTERRUPT_AREA
+014     @INTERRUPT_AREA
+015     @INTERRUPT_AREA
+016-017 strtok.save
+018-01B _Randseed
+01C     @CURRENT_TASK
+01D     SEM_RX_READY
+01E     MTX_RX_BUFFER
+01F     MTX_VALVE_ST
+020     MTX_UART
+021     MTX_CLOCK
+022     MTX_EEPROM
+023-054 RxBuffer
+055     state1
+056     state2
+057     state3
+058     state4
+059     state5
+05A     state6
+05B     state7
+05C     state8
+05D     hr
+05E     min
+05F     sec
+060     bwminv1
+061     bwminv2
+062.0   vanoflg1
+062.1   vanoflg2
+062.2   vanoflg3
+062.3   vanoflg4
+062.4   vanoflg5
+062.5   vanoflg6
+062.6   vanoflg7
+062.7   vanoflg8
+063.0   txflg
+064     vno1
+065     vno2
+066     vno3
+067     vno4
+068     vno5
+069     vno6
+06A     vno7
+06B     vno8
+06C-074 TimeBuffer
+075     clock_tick_count
+076     isr_state
+077     isr_idx
+078-07E @TASKINFO1_2_2_0_0
+07F-085 @TASKINFO2_2_2_0_0
+086-08C @TASKINFO3_2_2_0_0
+08D     MAIN.@SCRATCH1
+09C     RDA_isr.b
+09D     RDA_isr.@SCRATCH1
+09E     RDA_isr.@SCRATCH2
+09F     Task_TxValve.s1
+09F     Task_RxProcess.@SCRATCH1
+09F     @PSTRINGR_9600_31766_31767.@SCRATCH1
+0A0     Task_TxValve.s2
+0A0     @PSTRINGR_9600_31766_31767.@SCRATCH2
+0A1     Task_TxValve.s3
+0A2     Task_TxValve.s4
+0A3     Task_TxValve.s5
+0A4     Task_TxValve.s6
+0A5     Task_TxValve.s7
+0A6     Task_TxValve.s8
+0A7     @PSTRINGCN_9600_31766_31767.P1
+0A7     Task_TxValve.@SCRATCH1
+0A8     @delay_ms1.P1
+0A8     @PSTRINGCN_9600_31766_31767.@SCRATCH1
+0A9     @PSTRINGCN_9600_31766_31767.@SCRATCH2
+F55     CCP_5
+F55     CCP_5_LOW
+F56     CCP_5_HIGH
+F58     CCP_4_LOW
+F58     CCP_4
+F59     CCP_4_HIGH
+F5E     CCP_3
+F5E     CCP_3_LOW
+F5F     CCP_3_HIGH
+F67     CCP_2_LOW
+F67     CCP_2
+F68     CCP_2_HIGH
+F78.6   C2OUT
+F79.6   C1OUT
+FAB     RCSTA
+FAB.1   OERR
+FAB.2   FERR
+FAB.4   CREN
+FBE     CCP_1_LOW
+FBE     CCP_1
+FBF     CCP_1_HIGH
+FE1-FE2 @READ_PACKED_MEMORY.P1
+FE1-FE2 @WRITE_PACKED_MEMORY.P2
+FE9-FEA @WRITE_PACKED_MEMORY.P1
+FE9-FEA @READ_PACKED_MEMORY.P2
+FE9-FEA @WRITE_PROGRAM_MEMORY.P3
+FE9-FEA @READ_PROGRAM_MEMORY.P4
+FF6-FF8 @READ_PROGRAM_MEMORY.P1
+FF6-FF8 @WRITE_PROGRAM_MEMORY.P2
+
+ROM Allocation:
+000096  @const1072.call
+0000B6  RDA_isr
+000198  parse_packet
+0001FE  @PSTRINGCN_9600_31766_31767
+00021E  @PSTRINGR_9600_31766_31767
+000246  @delay_ms1
+00026C  Task_RxProcess
+00064C  @const1050.call
+000666  @const1054.call
+000698  @const1055.call
+0006CA  Task_TxValve
+000824  @const1066.call
+000854  Task_TimeClock
+000934  @cinit1
+000934  MAIN
+0009A4  @cinit2
+0136  StrtoulGO
+0136  StrtolGO
+
+Project Directory:
+    C:\Lora_Rtos_Pic\
+
+Project Files:
+    lorawan_valve_timer_a.c                                 [05-Mar-26 10:43  CRC=484B3B47]
+    ..\Program Files (x86)\PICC\Devices\18F25K22.h          [12-Nov-13 14:35  CRC=C9966415]
+    ..\Program Files (x86)\PICC\Drivers\stdlib.h            [08-Jun-11 14:39  CRC=0B6669CF]
+    ..\Program Files (x86)\PICC\Drivers\stddef.h            [16-Jul-10 09:27  CRC=897CEC6C]
+    ..\Program Files (x86)\PICC\Drivers\string.h            [14-Jul-11 10:13  CRC=23EDEC8F]
+    ..\Program Files (x86)\PICC\Drivers\ctype.h             [03-Jan-08 13:55  CRC=2D1F019F]
+    ..\Program Files (x86)\PICC\Drivers\internal_eeprom.c   [24-Aug-12 16:54  CRC=D75DC435]
+
+Source signature=A68D6C2F
+
+Units:
+    lorawan_valve_timer_a (main)
+
+Compiler Settings:
+    Processor:      PIC18F25K22
+    Pointer Size:   16
+    ADC Range:      0-1023
+    Opt Level:      9
+    Short,Int,Long: UNSIGNED: 1,8,16
+    Float,Double:   32,32
+
+Task Info:
+    Ticks: 100 ns
+    Cycle: 10 ms
+
+Tasks:
+    Task_RxProcess
+    Task_TxValve
+    Task_TimeClock
+
+Task Schedule:
+       5 ms  1049:Task_RxProcess
+       8 ms  1057:Task_TxValve
+       2 ms  1068:Task_TimeClock
+    Sync to next 10 ms
+
+Output Files:
+    XREF file:   lorawan_valve_timer_a.xsym
+    Errors:      lorawan_valve_timer_a.err
+    Ext Symbols: lorawan_valve_timer_a.esym
+    INHX32:      lorawan_valve_timer_a.hex
+    Symbols:     lorawan_valve_timer_a.sym
+    List:        lorawan_valve_timer_a.lst
+    Debug/COFF:  lorawan_valve_timer_a.cof
+    Project:     lorawan_valve_timer_a.ccspjt
+    Call Tree:   lorawan_valve_timer_a.tre
+    Statistics:  lorawan_valve_timer_a.STA

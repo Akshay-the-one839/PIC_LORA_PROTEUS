@@ -1,0 +1,560 @@
+// =============================================================
+//  Valve Controller — PIC18F25K22 + FreeRTOS
+//  Architecture:
+//    ISR          ? fills RingBuffer (lock-free circular buffer)
+//    UART_Task    ? drains ring, parses packet, posts to ParseQueue
+//    Valve_Task   ? receives ParsedPacket, drives GPIO outputs
+//    TX_Task      ? waits on TxSemaphore, sends $A,... reply
+//    Clock_Task   ? maintains HH:MM:SS using Timer1 semaphore
+//
+//  Synchronisation:
+//    g_ring_mutex    — protects ring buffer read side (ISR writes lock-free)
+//    g_parse_queue   — carries ParsedPacket structs from UART?Valve task
+//    g_tx_semaphore  — binary semaphore signals TX_Task to send
+//    g_clock_mutex   — protects shared clock variables hr/min/sec
+//    g_timer1_sem    — binary semaphore given by Timer1 ISR each tick
+// =============================================================
+
+#include <18F25K22.h>
+#device ADC=10
+#INCLUDE <stdlib.h>
+#INCLUDE <string.h>
+
+#fuses HSM,PUT,NOPROTECT,NOLVP,NOWDT,NOBROWNOUT,NOPLLEN,NOPBADEN
+#fuses IESO
+#use delay(xtal=20MHz, clock=20MHz)
+#byte clock_source = getenv("clock")
+
+#use rs232(stream=COM_1, baud=9600, parity=N, xmit=PIN_C6, rcv=PIN_C7, bits=8)
+#include "internal_eeprom.c"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "semphr.h"
+
+// -------------------------------------------------------
+// GPIO pin definitions
+// -------------------------------------------------------
+#define V1     PIN_B3
+#define V2     PIN_B2
+#define V3     PIN_B0
+#define V4     PIN_B1
+#define V5     PIN_B6
+#define V6     PIN_B5
+#define V7     PIN_B7
+#define V8     PIN_B4
+#define SIGLED PIN_C3
+
+// -------------------------------------------------------
+// UART hardware register bits (PIC18F25K22)
+// -------------------------------------------------------
+#byte RCSTA  = 0xFAB
+#bit  OERR   = RCSTA.1
+#bit  FERR   = RCSTA.2
+#bit  CREN   = RCSTA.4
+
+// -------------------------------------------------------
+// FreeRTOS task priorities
+//   Higher number = higher priority
+//   UART_Task must be highest so it drains ISR ring fast
+// -------------------------------------------------------
+#define PRIORITY_UART    4    // highest — drain ISR ring immediately
+#define PRIORITY_VALVE   3    // high    — act on parsed commands fast
+#define PRIORITY_TX      2    // medium  — send reply when signalled
+#define PRIORITY_CLOCK   1    // low     — 1-second housekeeping
+
+// -------------------------------------------------------
+// Stack sizes (words — PIC18 word = 1 byte in CCS FreeRTOS port)
+// -------------------------------------------------------
+#define STACK_UART    256
+#define STACK_VALVE   256
+#define STACK_TX      192
+#define STACK_CLOCK   128
+
+// -------------------------------------------------------
+// Ring buffer (lock-free ISR write, mutex-protected read)
+// Power-of-2 size allows fast masking instead of modulo
+// -------------------------------------------------------
+#define RING_SIZE  128          // must be power of 2
+#define RING_MASK  (RING_SIZE - 1)
+
+volatile char  g_ring[RING_SIZE];
+volatile int8  g_ring_head = 0;  // written ONLY by ISR
+volatile int8  g_ring_tail = 0;  // read   ONLY by UART_Task (under mutex)
+
+// -------------------------------------------------------
+// Parsed packet structure — passed through ParseQueue
+// -------------------------------------------------------
+typedef struct {
+    char slave_id;          // 'A', 'B', or 'C'
+    char time_str[9];       // "HH:MM:SS\0"
+    char vno[8];            // vno1..vno8
+    char state[8];          // state1..state8
+} ParsedPacket_t;
+
+// -------------------------------------------------------
+// Shared clock state — protected by g_clock_mutex
+// -------------------------------------------------------
+typedef struct {
+    int8 hr;
+    int8 min;
+    int8 sec;
+    int8 bwminv1;
+    int8 bwminv2;
+} ClockState_t;
+
+static ClockState_t g_clock = {0, 0, 0, 0, 0};
+
+// -------------------------------------------------------
+// Valve ack states (for TX reply) — protected by g_valve_mutex
+// -------------------------------------------------------
+static char g_valve_state[8] = {'0','0','0','0','0','0','0','0'};
+static int1 g_vanoflg[8]     = {0,0,0,0,0,0,0,0};
+
+// -------------------------------------------------------
+// FreeRTOS handles
+// -------------------------------------------------------
+static QueueHandle_t     g_parse_queue   = NULL;  // ParsedPacket_t queue depth 4
+static SemaphoreHandle_t g_ring_mutex    = NULL;  // protects ring tail reads
+static SemaphoreHandle_t g_tx_semaphore = NULL;  // signals TX_Task
+static SemaphoreHandle_t g_clock_mutex  = NULL;  // protects ClockState_t
+static SemaphoreHandle_t g_valve_mutex  = NULL;  // protects g_valve_state[]
+static SemaphoreHandle_t g_timer1_sem   = NULL;  // Timer1 ISR ? Clock_Task
+
+// -------------------------------------------------------
+// EEPROM helpers
+// -------------------------------------------------------
+#define EEPROM_BASE  0
+
+static void eeprom_store(unsigned int16 addr, unsigned char val) {
+    if (addr < 256) write_eeprom(addr, val);
+}
+
+// =============================================================
+//  Timer1 ISR — gives g_timer1_sem every ~50ms tick
+//  Clock_Task accumulates 20 ticks = 1 second
+// =============================================================
+#INT_TIMER1
+void timer1_isr(void)
+{
+    set_timer1(34286);   // reload for ~50ms
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(g_timer1_sem, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// =============================================================
+//  UART RDA ISR — writes raw bytes into ring buffer ONLY
+//  No parsing, no blocking, no printf — absolute minimum work
+// =============================================================
+#int_RDA
+void RDA_isr(void)
+{
+    // Hardware error recovery
+    if (oerr) { CREN = 0; CREN = 1; return; }
+    if (ferr) { getc(COM_1); return; }
+
+    char c = getc(COM_1);
+
+    // Lock-free ring write: ISR is the ONLY writer
+    int8 next_head = (g_ring_head + 1) & RING_MASK;
+    if (next_head != g_ring_tail) {   // drop if full — never block in ISR
+        g_ring[g_ring_head] = c;
+        g_ring_head = next_head;
+    }
+    // No yield needed — UART_Task polls via its own loop
+}
+
+// =============================================================
+//  UART_Task (Priority 4 — highest)
+//  Drains ring buffer, assembles packet, posts to parse queue
+//
+//  State machine:
+//    WAIT_DOLLAR  ? looking for '$'
+//    WAIT_M       ? looking for 'M'
+//    WAIT_STAR1   ? discard '*'
+//    WAIT_SLAVEID ? read 'A'/'B'/'C'
+//    WAIT_STAR2   ? discard '*'
+//    READ_PAYLOAD ? accumulate until '#'
+// =============================================================
+typedef enum {
+    WAIT_DOLLAR = 0,
+    WAIT_M,
+    WAIT_STAR1,
+    WAIT_SLAVEID,
+    WAIT_STAR2,
+    READ_PAYLOAD
+} UartState_t;
+
+static void UART_Task(void *pvParameters)
+{
+    UartState_t  state    = WAIT_DOLLAR;
+    char         slave_id = ' ';
+    char         payload[50];
+    int8         pay_idx  = 0;
+
+    for (;;)
+    {
+        // ---- Read one byte from ring buffer ----
+        char byte_available = 0;
+        char c = 0;
+
+        if (xSemaphoreTake(g_ring_mutex, pdMS_TO_TICKS(5)) == pdTRUE)
+        {
+            if (g_ring_tail != g_ring_head)
+            {
+                c = g_ring[g_ring_tail];
+                g_ring_tail = (g_ring_tail + 1) & RING_MASK;
+                byte_available = 1;
+            }
+            xSemaphoreGive(g_ring_mutex);
+        }
+
+        if (!byte_available)
+        {
+            // Nothing in ring — yield for 1 tick then retry
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        // ---- State machine ----
+        switch (state)
+        {
+            case WAIT_DOLLAR:
+                if (c == '$') state = WAIT_M;
+                break;
+
+            case WAIT_M:
+                state = (c == 'M') ? WAIT_STAR1 : WAIT_DOLLAR;
+                break;
+
+            case WAIT_STAR1:
+                state = (c == '*') ? WAIT_SLAVEID : WAIT_DOLLAR;
+                break;
+
+            case WAIT_SLAVEID:
+                if (c == 'A' || c == 'B' || c == 'C') {
+                    slave_id = c;
+                    state = WAIT_STAR2;
+                } else {
+                    state = WAIT_DOLLAR;   // unexpected — restart
+                }
+                break;
+
+            case WAIT_STAR2:
+                state   = (c == '*') ? READ_PAYLOAD : WAIT_DOLLAR;
+                pay_idx = 0;
+                break;
+
+            case READ_PAYLOAD:
+                if (c == '#')
+                {
+                    // ---- End of packet — parse and post ----
+                    payload[pay_idx] = '\0';
+
+                    // Payload: "1*0*0*02:00:00*2*0*3*0*4*0*5*0*6*0*7*0*8*0"
+                    // Positions (0-based):
+                    //  [0]      vno1
+                    //  [2]      state1
+                    //  [4]      extra field (skip)
+                    //  [6..13]  time "HH:MM:SS"
+                    //  [15]     vno2,  [17] state2
+                    //  [19]     vno3,  [21] state3
+                    //  [23]     vno4,  [25] state4
+                    //  [27]     vno5,  [29] state5
+                    //  [31]     vno6,  [33] state6
+                    //  [35]     vno7,  [37] state7
+                    //  [39]     vno8,  [41] state8
+
+                    if (pay_idx >= 42)   // sanity check — must be full packet
+                    {
+                        ParsedPacket_t pkt;
+                        pkt.slave_id = slave_id;
+
+                        // Time
+                        memcpy(pkt.time_str, &payload[6], 8);
+                        pkt.time_str[8] = '\0';
+
+                        // vno1 / state1
+                        pkt.vno[0]   = payload[0];
+                        pkt.state[0] = payload[2];
+
+                        // vno2..vno8 / state2..state8
+                        pkt.vno[1]   = payload[15]; pkt.state[1] = payload[17];
+                        pkt.vno[2]   = payload[19]; pkt.state[2] = payload[21];
+                        pkt.vno[3]   = payload[23]; pkt.state[3] = payload[25];
+                        pkt.vno[4]   = payload[27]; pkt.state[4] = payload[29];
+                        pkt.vno[5]   = payload[31]; pkt.state[5] = payload[33];
+                        pkt.vno[6]   = payload[35]; pkt.state[6] = payload[37];
+                        pkt.vno[7]   = payload[39]; pkt.state[7] = payload[41];
+
+                        // Post to Valve_Task — don't block (drop if queue full)
+                        xQueueSend(g_parse_queue, &pkt, 0);
+
+                        // Debug print (safe here — not in ISR)
+                        printf("\r\n[UART_Task] Pkt SlaveID=%c Time=%s\r\n",
+                               pkt.slave_id, pkt.time_str);
+                        printf("V1=%c S1=%c | V2=%c S2=%c | V3=%c S3=%c | V4=%c S4=%c\r\n",
+                               pkt.vno[0], pkt.state[0],
+                               pkt.vno[1], pkt.state[1],
+                               pkt.vno[2], pkt.state[2],
+                               pkt.vno[3], pkt.state[3]);
+                        printf("V5=%c S5=%c | V6=%c S6=%c | V7=%c S7=%c | V8=%c S8=%c\r\n",
+                               pkt.vno[4], pkt.state[4],
+                               pkt.vno[5], pkt.state[5],
+                               pkt.vno[6], pkt.state[6],
+                               pkt.vno[7], pkt.state[7]);
+                    }
+                    else
+                    {
+                        printf("\r\n[UART_Task] Short packet (%d bytes) — dropped\r\n", pay_idx);
+                    }
+
+                    state = WAIT_DOLLAR;   // ready for next packet
+                }
+                else if (pay_idx < 49)
+                {
+                    payload[pay_idx++] = c;
+                }
+                else
+                {
+                    // Overflow — abort this packet
+                    state = WAIT_DOLLAR;
+                    printf("\r\n[UART_Task] Payload overflow — reset\r\n");
+                }
+                break;
+
+            default:
+                state = WAIT_DOLLAR;
+                break;
+        }
+    }
+}
+
+// =============================================================
+//  Valve_Task (Priority 3)
+//  Blocks on g_parse_queue — wakes instantly when packet arrives
+//  Drives GPIO and signals TX_Task when done
+// =============================================================
+static void Valve_Task(void *pvParameters)
+{
+    ParsedPacket_t pkt;
+
+    for (;;)
+    {
+        // Block indefinitely until UART_Task posts a packet
+        if (xQueueReceive(g_parse_queue, &pkt, portMAX_DELAY) == pdTRUE)
+        {
+            // Take valve mutex before touching shared valve state
+            if (xSemaphoreTake(g_valve_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                for (int8 v = 0; v < 8; v++)
+                {
+                    char expected_vno = '1' + v;   // '1'..'8'
+
+                    if (pkt.vno[v] != expected_vno) continue;
+
+                    if (pkt.state[v] == '1' && g_vanoflg[v] == 0)
+                    {
+                        // Turn valve ON
+                        switch(v) {
+                            case 0: output_high(V1); break;
+                            case 1: output_high(V2); break;
+                            case 2: output_high(V3); break;
+                            case 3: output_high(V4); break;
+                            case 4: output_high(V5); break;
+                            case 5: output_high(V6); break;
+                            case 6: output_high(V7); break;
+                            case 7: output_high(V8); break;
+                        }
+                        g_vanoflg[v]     = 1;
+                        g_valve_state[v] = '1';
+
+                        printf("[Valve_Task] V%d ON\r\n", v + 1);
+
+                        // Delay only for V3..V8 (mechanical settle)
+                        if (v >= 2) {
+                            xSemaphoreGive(g_valve_mutex);
+                            vTaskDelay(pdMS_TO_TICKS(2000));  // non-blocking delay!
+                            xSemaphoreTake(g_valve_mutex, pdMS_TO_TICKS(100));
+                        }
+                    }
+                    else if (pkt.state[v] == '0' && g_vanoflg[v] == 1)
+                    {
+                        // Turn valve OFF
+                        switch(v) {
+                            case 0: output_low(V1); break;
+                            case 1: output_low(V2); break;
+                            case 2: output_low(V3); break;
+                            case 3: output_low(V4); break;
+                            case 4: output_low(V5); break;
+                            case 5: output_low(V6); break;
+                            case 6: output_low(V7); break;
+                            case 7: output_low(V8); break;
+                        }
+                        g_vanoflg[v]     = 0;
+                        g_valve_state[v] = '0';
+
+                        printf("[Valve_Task] V%d OFF\r\n", v + 1);
+                    }
+                }
+
+                xSemaphoreGive(g_valve_mutex);
+            }
+
+            // Signal TX_Task to send acknowledgement reply
+            xSemaphoreGive(g_tx_semaphore);
+        }
+    }
+}
+
+// =============================================================
+//  TX_Task (Priority 2)
+//  Waits on g_tx_semaphore — sends $A,1,s1,2,s2,...,8,s8, reply
+// =============================================================
+static void TX_Task(void *pvParameters)
+{
+    for (;;)
+    {
+        // Block until Valve_Task signals that states have changed
+        if (xSemaphoreTake(g_tx_semaphore, portMAX_DELAY) == pdTRUE)
+        {
+            // Snapshot valve states under mutex
+            char snap[8];
+            if (xSemaphoreTake(g_valve_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                memcpy(snap, g_valve_state, 8);
+                xSemaphoreGive(g_valve_mutex);
+            }
+            else
+            {
+                // Could not get mutex — skip this TX cycle
+                continue;
+            }
+
+            output_high(SIGLED);
+
+            // Send reply 5 times with 200ms gap (matches original txvalve logic)
+            for (int8 rep = 0; rep < 5; rep++)
+            {
+                printf("$A,1,%c,2,%c,3,%c,4,%c,5,%c,6,%c,7,%c,8,%c,\r\n",
+                       snap[0], snap[1], snap[2], snap[3],
+                       snap[4], snap[5], snap[6], snap[7]);
+
+                vTaskDelay(pdMS_TO_TICKS(200));  // non-blocking 200ms gap
+            }
+
+            output_low(SIGLED);
+
+            printf("[TX_Task] Reply sent\r\n");
+        }
+    }
+}
+
+// =============================================================
+//  Clock_Task (Priority 1 — lowest)
+//  Waits on g_timer1_sem (given every ~50ms by Timer1 ISR)
+//  Counts 20 ticks = 1 second, updates ClockState_t under mutex
+// =============================================================
+static void Clock_Task(void *pvParameters)
+{
+    int8 tick_count = 0;
+
+    for (;;)
+    {
+        // Block until Timer1 ISR gives semaphore (~50ms tick)
+        if (xSemaphoreTake(g_timer1_sem, portMAX_DELAY) == pdTRUE)
+        {
+            tick_count++;
+            if (tick_count < 20) continue;   // not 1 second yet
+
+            tick_count = 0;   // reset for next second
+
+            if (xSemaphoreTake(g_clock_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+            {
+                g_clock.sec++;
+
+                if (g_clock.sec >= 60)
+                {
+                    g_clock.sec = 0;
+                    g_clock.min++;
+                    g_clock.bwminv1++;
+                    if (g_clock.bwminv1 >= 11) g_clock.bwminv1 = 0;
+                    g_clock.bwminv2++;
+                    if (g_clock.bwminv2 >= 11) g_clock.bwminv2 = 0;
+
+                    // Persist hr/min to EEPROM every minute
+                    eeprom_store(EEPROM_BASE + 40, g_clock.hr);
+                    eeprom_store(EEPROM_BASE + 41, g_clock.min);
+
+                    if (g_clock.min >= 60) {
+                        g_clock.min = 0;
+                        g_clock.hr++;
+                    }
+                    if (g_clock.hr >= 24) {
+                        g_clock.hr = 0;
+                    }
+                }
+
+                xSemaphoreGive(g_clock_mutex);
+            }
+        }
+    }
+}
+
+// =============================================================
+//  main — create all FreeRTOS objects, start scheduler
+// =============================================================
+void main(void)
+{
+    // ---- GPIO init ----
+    output_b(0x00);
+    set_tris_a(0xFF);
+    SET_TRIS_b(0xCF);
+    SET_TRIS_c(0xB8);
+
+    output_low(V1); output_low(V2); output_low(V3); output_low(V4);
+    output_low(V5); output_low(V6); output_low(V7); output_low(V8);
+    output_low(SIGLED);
+
+    // ---- Timer1 setup (do NOT start yet — scheduler starts it) ----
+    setup_timer_1(T1_INTERNAL | T1_DIV_BY_8);
+    set_timer1(34286);
+
+    // ---- Create FreeRTOS synchronisation objects ----
+    g_ring_mutex    = xSemaphoreCreateMutex();
+    g_clock_mutex   = xSemaphoreCreateMutex();
+    g_valve_mutex   = xSemaphoreCreateMutex();
+    g_tx_semaphore  = xSemaphoreCreateBinary();
+    g_timer1_sem    = xSemaphoreCreateBinary();
+    g_parse_queue   = xQueueCreate(4, sizeof(ParsedPacket_t));
+
+    // Verify all objects created successfully
+    if (!g_ring_mutex   || !g_clock_mutex  || !g_valve_mutex ||
+        !g_tx_semaphore || !g_timer1_sem   || !g_parse_queue)
+    {
+        // Fatal — halt and signal error on SIGLED
+        output_high(SIGLED);
+        while(1);
+    }
+
+    // ---- Create tasks ----
+    xTaskCreate(UART_Task,  "UART",  STACK_UART,  NULL, PRIORITY_UART,  NULL);
+    xTaskCreate(Valve_Task, "VALVE", STACK_VALVE, NULL, PRIORITY_VALVE, NULL);
+    xTaskCreate(TX_Task,    "TX",    STACK_TX,    NULL, PRIORITY_TX,    NULL);
+    xTaskCreate(Clock_Task, "CLOCK", STACK_CLOCK, NULL, PRIORITY_CLOCK, NULL);
+
+    // ---- Enable interrupts ----
+    enable_interrupts(INT_RDA);
+    enable_interrupts(INT_TIMER1);
+    enable_interrupts(GLOBAL);
+
+    printf("\r\n[MAIN] FreeRTOS scheduler starting...\r\n");
+
+    // ---- Start FreeRTOS scheduler — never returns ----
+    vTaskStartScheduler();
+
+    // Should never reach here
+    while(1);
+}

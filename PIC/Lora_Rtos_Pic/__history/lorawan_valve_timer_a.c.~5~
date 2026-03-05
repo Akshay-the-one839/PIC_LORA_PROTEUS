@@ -1,0 +1,542 @@
+ 
+
+#include <18F25K22.h>
+#device ADC=10
+#INCLUDE <stdlib.h> 
+
+#fuses HSM,PUT,NOPROTECT,NOLVP,NOWDT,NOBROWNOUT,NOPLLEN,NOPBADEN
+#fuses IESO    /* enable internal/external oscillator switchover mode */
+#use delay(xtal=20MHz, clock=20MHz) /* use clock frequency of 16 MHz for delays */
+#byte clock_source=getenv("clock")
+
+#use rs232(stream=COM_1,baud=9600,parity=N,xmit=PIN_C6,rcv=PIN_C7,bits=8)
+//#use rs232(xmit = PIN_C6, rcv = PIN_C7, baud = 9600)
+#include "internal_eeprom.c"
+
+//#use fast_io (A)
+//#use fast_io (C)
+//#use fast_io (B)
+
+ 
+
+#define V1 PIN_B3 
+#define V2 PIN_B2 
+#define V3 PIN_B0 
+#define V4 PIN_B1 
+#define V5 PIN_B6 
+#define V6 PIN_B5 
+#define V7 PIN_B7 
+#define V8 PIN_B4 
+
+#define SIGLED PIN_C3 
+
+int i=0;
+int j=0;
+int k=0;
+ char ch;
+ char a[4];
+ char b[3];
+ char c[2];  
+ char state1='0'; 
+ char state2='0';
+ char state3='0';
+ char state4='0';
+ char state5='0'; 
+ char state6='0';
+ char state7='0';
+ char state8='0';
+
+int1 flgg=0;
+int1 flg=0;
+
+//unsigned int dset=0;
+//unsigned int dset1=0;
+#byte RCSTA = 0xFAB
+#bit OERR = RCSTA.1
+#bit FERR = RCSTA.2
+#bit CREN = RCSTA.4
+char s[1];
+
+char bw[2];
+
+int1 RX_Command_Ready = 0;     
+        
+char RxBuffer[33];   
+int8 Index = 0;     
+
+char vno1;
+char vno2;
+char vno3;
+char vno4;
+char vno5;
+char vno6;
+char vno7;
+char vno8;
+
+char star;
+char timer;
+int1 vanoflg1=0;
+int1 vanoflg2=0;
+int1 vanoflg3=0;
+int1 vanoflg4=0;
+int1 vanoflg5=0;
+int1 vanoflg6=0;
+int1 vanoflg7=0;
+int1 vanoflg8=0;
+
+int1 txflg=0;
+int1  txflgg=0;
+
+int8 overflow_count = 0;  // Counter to track Timer1 overflows
+int8 sec=0 ;
+int8 min=0 ;
+int8 hr=0 ;
+int8 bwmin=0 ;
+int8 bwminv1=0;
+int8 bwminv2=0;
+
+unsigned int16 eeprom_base_address = 0; // Starting address in EEPROM
+ 
+ 
+// Function to initialize Timer1 for a 1-second interrupt
+void setup_timer1_for_1s_interrupt() {
+    setup_timer_1(T1_INTERNAL | T1_DIV_BY_8);
+    set_timer1(34286);  // 1-second interval
+    enable_interrupts(INT_TIMER1);  // Enable Timer1 interrupt
+    
+}  
+
+#INT_TIMER1
+void timer1_isr() {
+
+      overflow_count++;  // Increment overflow count
+
+      set_timer1(34286);
+      
+   if (overflow_count >= 20) {        //  for 1-second delay 
+            sec++;
+        overflow_count = 0;  // Reset overflow count
+      
+        if(sec >= 59){
+        
+        // output_low(DRYLED );//l1 off 
+   
+        sec=0;
+        min++;
+        bwminv1++ ;
+        if(bwminv1 >=11)
+        {
+         bwminv1=0;
+        }
+         bwminv2++ ;
+        if(bwminv2 >=11)
+        {
+         bwminv2=0;
+        }
+        // retrive the hours and minutes before start the timer
+      write_eeprom(eeprom_base_address + 40, hr); // to read previous hr stored 
+      write_eeprom(eeprom_base_address + 41, min); // to read previous min stored
+
+        if(min >= 59){
+        min=0;
+        hr++;
+
+        }
+        
+        if(hr >= 24){
+        
+        hr=0;
+        
+        }
+        
+        }
+            
+    }
+    
+}
+
+// Function to store a single byte value in EEPROM
+void store_byte(unsigned int16 address, unsigned char value) {
+    if (address < 256) { // Ensure address is within EEPROM range
+        write_eeprom(address, value);
+    }
+}
+
+// Function to retrieve a single byte value from EEPROM
+unsigned char retrieve_byte(unsigned int16 address) {
+    if (address < 256) { // Ensure address is within EEPROM range
+        return read_eeprom(address);
+    }
+    return 0; // Default value in case of invalid address
+}
+
+#int_RDA
+void RDA_isr(void)
+{
+    char temp; 
+    char temp3;
+
+    // ---------- 1) UART ERROR CHECK (hardware flags) ----------
+    // Handle Overrun: must reset CREN to recover receiver hardware.
+    if (oerr) {           // Overrun error (CCS alias for OERR)
+        CREN = 0;         // disable receiver to clear overrun condition
+        CREN = 1;         // re-enable receiver
+        return;           // discard and skip processing damaged data
+    }
+    // Handle Framing error: discard the problematic byte and continue
+    if (ferr) {
+        char tmp = getc(COM_1); // read and drop one byte from FIFO
+        return;
+    }
+
+    // ---------- 2) Normal receive ----------
+    Index = 0;
+    temp = getc(COM_1);  
+   // printf("\r\nFirst Char: %c\r\n", temp);
+
+    if (temp == 'A')
+    {    
+      //  printf("Data: ");
+        for (int i = 0; i < 34; i++)     
+        {
+            temp3 = getc(COM_1);    
+            printf("%c", RxBuffer[i]);
+            RxBuffer[Index] = temp3;
+            Index++;        
+        }
+       // printf("\r\n");
+        RX_Command_Ready = 1;
+    }
+    else if (temp == 'a')
+    {
+        txflg = 1; 
+    }
+}
+void txvalve()
+{
+
+  for(int16 i2=0;i2<5;i2++)
+      { 
+      
+         if(txflg==1)
+         {
+         output_high(SIGLED);
+            printf("$");
+            printf("A");
+            printf(",");
+            printf("1");     
+            printf(",");
+            printf("%c",state1); 
+            printf(",");
+            printf("2");     
+            printf(",");
+            printf("%c",state2); 
+            printf(",");
+            printf("3");     
+            printf(",");
+            printf("%c",state3); 
+            printf(",");
+            printf("4");     
+            printf(",");
+            printf("%c",state4); 
+            printf(",");
+            printf("5");     
+            printf(",");
+            printf("%c",state5); 
+            printf(",");
+            printf("6");     
+            printf(",");
+            printf("%c",state6); 
+            printf(",");
+            printf("7");     
+            printf(",");
+            printf("%c",state7); 
+            printf(",");
+            printf("8");     
+            printf(",");
+            printf("%c",state8); 
+            printf(",");
+            
+          
+            
+   }
+    
+              delay_ms(200);
+  } 
+        txflg=0;
+
+ output_low(SIGLED);
+}
+ 
+
+
+void main() {
+   output_b(0x00);  
+   set_tris_a(0xff); 
+   SET_TRIS_b(0xcf);
+   SET_TRIS_c(0xb8);  
+   
+   setup_timer1_for_1s_interrupt();  // Initialize Timer1           
+   setup_timer_1(T1_DISABLED); 
+   
+   enable_interrupts(INT_RDA);  
+   enable_interrupts(GLOBAL);
+   
+      output_low(V1);//l1 off 
+      output_low(V2);//l1 off 
+      output_low(V3);//l1 off 
+      output_low(V4);//l1 off 
+      output_low(V5);//l1 off 
+      output_low(V6);//l1 off 
+      output_low(V7);//l1 off 
+      output_low(V8);//l1 off 
+       output_low(SIGLED);
+      
+     // vno1='1';
+    //  state1='1';
+      
+ while(true)
+ {
+       
+  if(RX_Command_Ready ==1)                
+ {
+ ////////////////////////////////////////////////////////
+      Index=0;   
+      RX_Command_Ready =0;
+      vno1 = RxBuffer[Index];    //on/off-1/0      
+      Index++;//*
+      Index++;
+      state1= RxBuffer[Index];  
+      Index++;
+      Index++;
+      vno2 = RxBuffer[Index];    //on/off-1/0      
+      Index++;//*
+      Index++;
+      state2= RxBuffer[Index];  
+      Index++;
+      Index++; 
+      vno3 = RxBuffer[Index];    //on/off-1/0      
+      Index++;//*
+      Index++;
+      state3= RxBuffer[Index];  
+      Index++;
+      Index++; 
+      vno4 = RxBuffer[Index];    //on/off-1/0      
+      Index++;//*
+      Index++;
+      state4= RxBuffer[Index];  
+      Index++;
+      Index++; 
+       vno5 = RxBuffer[Index];    //on/off-1/0      
+      Index++;//*
+      Index++;
+      state5= RxBuffer[Index];  
+      Index++;
+      Index++; 
+       vno6 = RxBuffer[Index];    //on/off-1/0      
+      Index++;//*
+      Index++;
+      state6= RxBuffer[Index];  
+      Index++;
+      Index++; 
+       vno7 = RxBuffer[Index];    //on/off-1/0      
+      Index++;//*
+      Index++;
+      state7= RxBuffer[Index];  
+      Index++;
+      Index++; 
+       vno8 = RxBuffer[Index];    //on/off-1/0      
+      Index++;//*
+      Index++;
+      state8= RxBuffer[Index];  
+      Index++;
+      Index++; 
+      BW[0]= RxBuffer[Index];  
+      Index++;
+      BW[1]= RxBuffer[Index]; 
+      
+           
+            
+ /////////////V1//////////////////////////////////////////
+    if(vno1=='1' && vanoflg1==0) //Master 1
+    {
+        if(state1=='1')
+        {
+           
+           output_high(V1);//l1 on
+           vanoflg1=1;
+           
+        }
+    }
+    
+    if(vno1=='1' && vanoflg1==1)
+    {
+        if(state1=='0')
+        {
+           output_low(V1);//l1 off
+           vanoflg1=0;
+        }
+    }
+    //////////////////////////V2////////////////////////
+    if(vno2=='2' && vanoflg2==0)
+    {
+        if(state2=='1')
+        {
+          
+           output_high(V2);//l1 on
+           vanoflg2=1;
+          
+           
+        }
+    }   
+    
+    
+    if(vno2=='2' && vanoflg2==1)
+    {
+        if(state2=='0')
+        {
+           output_low(V2);//l1 off
+           vanoflg2=0;
+        }
+    }
+    ///////////////////////////////////////////////////////////////
+    
+    
+    ////////////////////////////V3///////////////////////////////
+      if(vno3=='3' && vanoflg3==0 )
+    {
+        if(state3=='1')
+        {
+           
+           output_high(V3);//l1 on
+           vanoflg3=1;
+            delay_ms(2000);
+        }
+    }
+    
+    if(vno3=='3' && vanoflg3==1)
+    {
+        if(state3=='0')
+        {
+           output_low(V3);//l1 off
+           vanoflg3=0;
+           
+        }
+    }   
+    
+    //////////////////////////////////////V4///////////////////////////////////
+    if(vno4=='4' && vanoflg4==0 )
+ {
+     if(state4=='1')
+     {
+          
+           output_high(V4);//l1 on
+           vanoflg4=1;
+           delay_ms(2000);
+       
+     }
+ }
+ 
+ if(vno4=='4' && vanoflg4==1 )
+ {
+     if(state4=='0')
+     {
+           output_low(V4);//l1 off
+           vanoflg4=0;
+     }
+ }
+ /////////////////////////////////V5/////////////////////////////////////////
+ if(vno5=='5' && vanoflg5==0 )
+ {
+     if(state5=='1')
+     {
+     
+           
+            output_high(V5);//l1 on
+            vanoflg5=1;
+             delay_ms(2000);
+     }
+ }
+ 
+ if(vno5=='5' && vanoflg5==1)
+ {
+     if(state5=='0')
+     {
+        output_low(V5);//l1 off
+        vanoflg5=0;
+     }
+ }
+ ///////////////////////////////////V6////////////////////////////////////////
+ if(vno6=='6' && vanoflg6==0 )
+ {
+     if(state6=='1')
+     {
+             
+           output_high(V6);//l1 on
+           vanoflg6=1;
+            delay_ms(2000);
+     }
+ }
+ 
+ if(vno6=='6' && vanoflg6==1 )
+ {
+     if(state6=='0')
+     {
+        output_low(V6);//l1 off
+        vanoflg6=0;
+     }
+ }
+ ///////////////////////////////////////V7//////////////////////////////
+ if(vno7=='7' && vanoflg7==0 )
+ {
+     if(state7=='1')
+     {
+               
+           output_high(V7);//l1 on
+           vanoflg7=1;
+            delay_ms(2000);
+     }
+ }
+ 
+ if(vno7=='7' && vanoflg7==1 )
+ {
+     if(state7=='0')
+     {
+        output_low(V7);//l1 off
+        vanoflg7=0;
+     }
+ }
+ 
+ ///////////////////////////V8////////////////////////////////////////////////
+ if(vno8=='8' && vanoflg8==0 )
+ {
+     if(state8=='1')
+     {
+                 
+           output_high(V8);//l1 on
+           vanoflg8=1;
+            delay_ms(2000);
+     }
+ }
+ 
+ if(vno8=='8' && vanoflg8==1 )
+ {
+     if(state8=='0')
+     {
+        output_low(V8);//l1 off
+        vanoflg8=0;
+     }
+ }
+         
+ }/////////rx flg end
+  output_low(SIGLED);  
+ if(txflg ==1 )
+ {
+    txvalve();
+ }
+
+    delay_ms(1000);
+    
+ }          //while
+      
+}     //main
